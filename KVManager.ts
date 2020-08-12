@@ -3,7 +3,7 @@ const kv = new pylon.KVNamespace(ns);
 const dataPrefix = 'data';
 
 interface TagPointer {
-  [dat: string]: number;
+  [key: string]: number;
 }
 
 interface KVMHeader extends pylon.JsonObject {
@@ -17,6 +17,14 @@ const newhdr: KVMHeader = {
   dataptr: {}
 };
 
+// KVManager manages the KV space for your bot, allowing you to store information more densely & bypass the 256 key limit.
+//  - With 256 tags and 8kB per tag, we have 2MB space to play with.
+//  - Future plan: Convert all items to bitstrings & then we can store more than 8kb in a key by splitting byte arrays.
+//  - Current plan: Handle data storage > 2kb
+//    - Support adding a chunk 'data1' when data0 fills up
+//    - Support adding another header 'header1' when we have more than 8kb worth of keys (probs not happening)
+//    - Request check-and-set with custom equality condition for faster setting
+// Works by storing multiple `key` within each `tag` plus a few `header tag` to manage information & reduce search time.
 class KVManager {
   protected static async getHeader(headerTag: string): Promise<KVMHeader> {
     const hdr = await kv.get<KVMHeader>(headerTag);
@@ -27,6 +35,7 @@ class KVManager {
     return hdr;
   }
 
+  // Updates a key within a tag.
   protected static async updateTag(
     tag: string,
     key: string,
@@ -39,6 +48,7 @@ class KVManager {
     });
   }
 
+  // Deletes a key within a tag & its corresponding header entry
   protected static async deleteTag(
     tag: string,
     headerTag: string,
@@ -56,12 +66,26 @@ class KVManager {
     });
   }
 
+  // Creates a header entry for a new key
   protected static async addKey(headerTag: string, key: string, tag: number) {
     kv.transact<KVMHeader>(headerTag, (hdr = newhdr) => {
       var ret = { ...hdr, dataptr: { ...hdr.dataptr } };
       ret.dataptr[key] = tag;
       return ret;
     });
+  }
+
+  static async get(key: string) {
+    const hdr = await KVManager.getHeader('header0');
+    if (!(key in hdr.dataptr)) {
+      return undefined;
+    }
+
+    const tag = dataPrefix + hdr.dataptr[key];
+    const dat = await kv.get<pylon.JsonObject>(tag);
+    if (dat == undefined)
+      throw new Error('Something fucked up. Recommend you to clear it all');
+    return dat[key];
   }
 
   static async set(key: string, value: pylon.Json) {
@@ -76,27 +100,12 @@ class KVManager {
     KVManager.updateTag(dataPrefix + tagNum, key, value);
   }
 
-  static async get(key: string) {
-    // return kv.get(key);
-    const hdr = await KVManager.getHeader('header0');
-    if (!(key in hdr.dataptr)) {
-      return undefined;
-    }
-
-    const tag = dataPrefix + hdr.dataptr[key];
-    const dat = await kv.get<pylon.JsonObject>(tag);
-    if (dat == undefined)
-      throw new Error('Something in the structure fucked up');
-    return dat[key];
-  }
-
   static async delete(key: string) {
     const hdr = await KVManager.getHeader('header0');
     if (!(key in hdr.dataptr)) return;
 
     const tag = dataPrefix + hdr.dataptr[key];
     KVManager.deleteTag(tag, 'header0', key);
-    // const dat = await kv.get<pylon.JsonObject>(tag);
   }
 
   static async keysUsed() {
@@ -104,13 +113,15 @@ class KVManager {
   }
 
   static async numKeys() {
-    return kv.count();
+    const hdr = await KVManager.getHeader('header0');
+    return Object.keys(hdr.dataptr).length;
   }
 
   static async clear() {
     return kv.clear();
   }
 
+  // get internal structure for debug
   static async items() {
     return kv.items();
   }
