@@ -1,10 +1,15 @@
 const ns = 'kv-manager';
 const kv = new pylon.KVNamespace(ns);
+const dataPrefix = 'data';
+
+interface TagPointer {
+  [dat: string]: number;
+}
 
 interface KVMHeader extends pylon.JsonObject {
   // lock: number;
   blocks: pylon.JsonArray;
-  dataptr: pylon.JsonObject;
+  dataptr: TagPointer;
 }
 const newhdr: KVMHeader = {
   // lock: 1,
@@ -34,7 +39,24 @@ class KVManager {
     });
   }
 
-  protected static async addKey(headerTag: string, key: string, tag: string) {
+  protected static async deleteTag(
+    tag: string,
+    headerTag: string,
+    key: string
+  ) {
+    kv.transact<pylon.JsonObject>(tag, (prev = {}) => {
+      var ret = { ...prev };
+      delete ret[key];
+      return ret;
+    });
+    kv.transact<KVMHeader>(headerTag, (hdr = newhdr) => {
+      var ret = { ...hdr, dataptr: { ...hdr.dataptr } };
+      delete ret.dataptr[key];
+      return ret;
+    });
+  }
+
+  protected static async addKey(headerTag: string, key: string, tag: number) {
     kv.transact<KVMHeader>(headerTag, (hdr = newhdr) => {
       var ret = { ...hdr, dataptr: { ...hdr.dataptr } };
       ret.dataptr[key] = tag;
@@ -44,21 +66,37 @@ class KVManager {
 
   static async set(key: string, value: pylon.Json) {
     const hdr = await KVManager.getHeader('header0');
+    var tagNum = 0;
     if (!(key in hdr.dataptr)) {
-      KVManager.addKey('header0', key, 'data0');
+      KVManager.addKey('header0', key, tagNum);
       console.log(`added key ${key}`);
+    } else {
+      tagNum = hdr.dataptr[key];
     }
-    KVManager.updateTag('data0', key, value);
+    KVManager.updateTag(dataPrefix + tagNum, key, value);
   }
 
   static async get(key: string) {
     // return kv.get(key);
     const hdr = await KVManager.getHeader('header0');
-    return JSON.stringify(hdr);
+    if (!(key in hdr.dataptr)) {
+      return undefined;
+    }
+
+    const tag = dataPrefix + hdr.dataptr[key];
+    const dat = await kv.get<pylon.JsonObject>(tag);
+    if (dat == undefined)
+      throw new Error('Something in the structure fucked up');
+    return dat[key];
   }
 
   static async delete(key: string) {
-    kv.delete(key);
+    const hdr = await KVManager.getHeader('header0');
+    if (!(key in hdr.dataptr)) return;
+
+    const tag = dataPrefix + hdr.dataptr[key];
+    KVManager.deleteTag(tag, 'header0', key);
+    // const dat = await kv.get<pylon.JsonObject>(tag);
   }
 
   static async keysUsed() {
