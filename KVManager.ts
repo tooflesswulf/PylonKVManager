@@ -1,7 +1,7 @@
 const ns = 'kv-manager';
 const kv = new pylon.KVNamespace(ns);
 const dataPrefix = 'data';
-const MAX_TAG_SIZE = 100;
+const MAX_TAG_SIZE = 200;
 
 type id_type = string;
 type item_type = pylon.Json;
@@ -10,19 +10,22 @@ interface DataPtr extends pylon.JsonObject {
   tag: number;
   id: id_type;
 }
+type DataPtrCompress = string;
 interface KVMHeader extends pylon.JsonObject {
   // lock: number;
-  blocks: pylon.JsonArray;
+  blocks: Array<number>;
   dataptr: {
     [k: string]: DataPtr;
   };
   next: number;
+  nextID: number;
 }
 const newhdr: KVMHeader = {
   // lock: 1,
   blocks: [],
   dataptr: {},
-  next: -1
+  next: -1,
+  nextID: 161 // First printable utf-16 code appears here, printable up to 7424
 };
 
 interface KVDataTag extends pylon.JsonObject {
@@ -40,6 +43,21 @@ const emptyTag: KVDataTag = {
 
 function sizeof(obj: pylon.Json) {
   return new TextEncoder().encode(JSON.stringify(obj)).byteLength;
+}
+
+// This pair of functions
+function num2str(n: number) {
+  var ret: string = '';
+  do {
+    ret += String.fromCharCode(n % 65535);
+    n = (n / 65535) >> 0;
+  } while (n > 0);
+  return ret;
+}
+function str2num(s: string) {
+  var num: number = 0;
+  for (var i = s.length - 1; i >= 0; i--) num = 65535 * num + s.charCodeAt(i);
+  return num;
 }
 
 // KVManager manages the KV space for your bot, allowing you to store information more densely & bypass the 256 key limit.
@@ -60,6 +78,31 @@ class KVManager {
     return hdr;
   }
 
+  protected static async findKeyHeader(
+    key: string
+  ): Promise<[number, KVMHeader | undefined]> {
+    const hdr = await KVManager.getHeader('header0');
+    if (!(key in hdr.dataptr)) return [-1, undefined];
+    return [0, hdr];
+  }
+  protected static async findDataPtr(key: string): Promise<DataPtr> {
+    const [hdrNum, hdr] = await KVManager.findKeyHeader(key);
+    // const hdr = await KVManager.getHeader('header0');
+    if (hdr == undefined) return { tag: -1, id: '' };
+
+    return hdr.dataptr[key];
+  }
+
+  protected static async incrementID(): Promise<number> {
+    const incremented = await kv.transactWithResult<KVMHeader, number>(
+      'header0',
+      (hdr = newhdr) => {
+        return { next: { ...hdr, nextID: hdr.nextID + 1 }, result: hdr.nextID };
+      }
+    );
+    return incremented.result;
+  }
+
   // Creates/updates a header entry for a key
   protected static async updateKeyHdr(hdrTag: string, k: string, dp: DataPtr) {
     kv.transact<KVMHeader>(hdrTag, (hdr = newhdr) => {
@@ -67,6 +110,7 @@ class KVManager {
         ...hdr,
         dataptr: { ...hdr.dataptr, [k]: dp }
       };
+      // if (str2num(dp.id) == hdr.nextID) ret.nextID++;
       return ret;
     });
   }
@@ -146,32 +190,37 @@ class KVManager {
     return datum.size - prevSize + newSize < MAX_TAG_SIZE;
   }
 
-  protected static async findTagSpace(
-    k: id_type,
-    v: item_type
-  ): Promise<number> {
-    const size = sizeof({ [k]: v });
-    const hdr = await KVManager.getHeader('header0');
+  // findEmptyTag finds a tag with enough space to fit a certain size.
+  protected static async findEmptyTag(size: number): Promise<number> {
+    const hdr = await KVManager.getHeader('header0'); // This one always header0
     var max: number = -1;
+
+    var promises = [];
     for (var b of hdr.blocks) {
       const blockNum = b as number;
       max = blockNum > max ? (blockNum as number) : max;
-      const datum = await kv.get<KVDataTag>(dataPrefix + blockNum);
-      if ((datum ? datum.size : 0) + size < MAX_TAG_SIZE) {
-        return blockNum;
-      }
+      promises.push(
+        kv.get<KVDataTag>(dataPrefix + blockNum).then((datum) => {
+          if ((datum ? datum.size : 0) + size < MAX_TAG_SIZE) 
+            throw blockNum;
+        })
+      );
     }
-    var tagNum = max + 1;
-    if (!(tagNum in hdr.blocks)) KVManager.addBlock(tagNum);
-    return tagNum;
+    return Promise.all(promises)
+      .then(() => {
+        // We had to add a new block.
+        var tagNum = max + 1;
+        if (!(tagNum in hdr.blocks)) KVManager.addBlock(tagNum);
+        return tagNum;
+      })
+      .catch((blockNum) => {
+        return blockNum;
+      });
   }
 
   static async get(key: string) {
-    const hdr = await KVManager.getHeader('header0');
-    if (!(key in hdr.dataptr)) return undefined;
-
-    const dptr = hdr.dataptr[key];
-    return KVManager.getData(dptr);
+    const dptr = await KVManager.findDataPtr(key);
+    return dptr.tag != -1 ? KVManager.getData(dptr) : undefined;
   }
 
   // Cases:
@@ -180,23 +229,23 @@ class KVManager {
   //  Key doesn't exist and needs to start a new tag
   //  Key already exists but needs to be moved to a new tag
   static async set(key: string, value: pylon.Json) {
-    const hdr = await KVManager.getHeader('header0');
-
-    var dptr: DataPtr = { id: key, tag: -1 };
-    var findNewTag = false;
+    var dptr = await KVManager.findDataPtr(key);
+    var findNewTag = true;
 
     // Check for in-place update case. Its simpler.
-    if (key in hdr.dataptr) {
-      dptr = hdr.dataptr[key];
-      findNewTag = await KVManager.itemUpdateWillFit(dptr, value);
-      if (!findNewTag) {
-        // If it exists but needs to be moved, we delete it from its corresponding tag.
-        KVManager.deleteKeyTag(dptr);
-      }
+    if (dptr.tag != -1) {
+      findNewTag = !(await KVManager.itemUpdateWillFit(dptr, value));
+      // If it exists but needs to be moved, we delete it from its original tag.
+      if (findNewTag) KVManager.deleteKeyTag(dptr);
+    } else {
+      // If key does not exist yet, assign new id
+      dptr.id = num2str(await KVManager.incrementID());
     }
 
-    if (!findNewTag) {
-      dptr.tag = await KVManager.findTagSpace(dptr.id, value);
+    // If the value needs a new home, search for it here.
+    if (findNewTag) {
+      const size = sizeof({ [dptr.id]: value });
+      dptr.tag = await KVManager.findEmptyTag(size);
       KVManager.updateKeyHdr('header0', key, dptr);
     }
 
@@ -204,11 +253,12 @@ class KVManager {
   }
 
   static async delete(key: string) {
-    const hdr = await KVManager.getHeader('header0');
-    if (!(key in hdr.dataptr)) return;
+    const [hdrNum, hdr] = await KVManager.findKeyHeader(key);
+    if (hdr == undefined) return;
     const dptr = hdr.dataptr[key];
+    // const dptr = await KVManager.findDataPtr(key);
 
-    KVManager.deleteKeyHdr('header0', key);
+    KVManager.deleteKeyHdr('header' + hdrNum, key);
     KVManager.deleteKeyTag(dptr);
   }
 
