@@ -3,25 +3,34 @@ const kv = new pylon.KVNamespace(ns);
 const dataPrefix = 'data';
 const MAX_TAG_SIZE = 100;
 
-interface TagPointer {
-  [key: string]: number;
-}
+type id_type = string;
+type item_type = pylon.Json;
 
+interface DataPtr extends pylon.JsonObject {
+  tag: number;
+  id: id_type;
+}
 interface KVMHeader extends pylon.JsonObject {
   // lock: number;
   blocks: pylon.JsonArray;
-  dataptr: TagPointer;
+  dataptr: {
+    [k: string]: DataPtr;
+  };
+  next: number;
 }
 const newhdr: KVMHeader = {
   // lock: 1,
   blocks: [],
-  dataptr: {}
+  dataptr: {},
+  next: -1
 };
 
 interface KVDataTag extends pylon.JsonObject {
   // lock: number;
   size: number;
-  data: pylon.JsonObject;
+  data: {
+    [id: string]: item_type;
+  };
 }
 const emptyTag: KVDataTag = {
   // lock: 1,
@@ -30,10 +39,7 @@ const emptyTag: KVDataTag = {
 };
 
 function sizeof(obj: pylon.Json) {
-  const str = JSON.stringify(obj);
-  var m = encodeURIComponent(str).match(/%[89ABab]/g);
-
-  return str.length + (m ? m.length : 0);
+  return new TextEncoder().encode(JSON.stringify(obj)).byteLength;
 }
 
 // KVManager manages the KV space for your bot, allowing you to store information more densely & bypass the 256 key limit.
@@ -55,9 +61,12 @@ class KVManager {
   }
 
   // Creates/updates a header entry for a key
-  protected static async updateKeyHdr(hdrTag: string, k: string, tag: number) {
+  protected static async updateKeyHdr(hdrTag: string, k: string, dp: DataPtr) {
     kv.transact<KVMHeader>(hdrTag, (hdr = newhdr) => {
-      var ret = { ...hdr, dataptr: { ...hdr.dataptr, [k]: tag } };
+      var ret = {
+        ...hdr,
+        dataptr: { ...hdr.dataptr, [k]: dp }
+      };
       return ret;
     });
   }
@@ -66,6 +75,7 @@ class KVManager {
   protected static async deleteKeyHdr(headerTag: string, key: string) {
     kv.transact<KVMHeader>(headerTag, (hdr) => {
       if (hdr == undefined) return;
+      if (Object.keys(hdr.dataptr).length == 1) return;
       var ret = { ...hdr, dataptr: { ...hdr.dataptr } };
       delete ret.dataptr[key];
       return ret;
@@ -94,38 +104,74 @@ class KVManager {
   }
 
   // Updates a key within a tag.
-  protected static async updateKeyTag(tag: string, k: string, v: pylon.Json) {
-    kv.transact<KVDataTag>(tag, (prev = emptyTag) => {
-      var ret = { ...prev, data: { ...prev.data, [k]: v } };
+  protected static async updateKeyTag(dptr: DataPtr, v: item_type) {
+    kv.transact<KVDataTag>(dataPrefix + dptr.tag, (prev = emptyTag) => {
+      var ret = { ...prev, data: { ...prev.data, [dptr.id]: v } };
       ret.size = sizeof(ret);
       return ret;
     });
   }
 
   // Deletes a key within a tag
-  protected static async deleteKeyTag(tag: string, key: string) {
+  protected static async deleteKeyTag(dptr: DataPtr) {
+    const tag = dataPrefix + dptr.tag;
     await kv.transact<KVDataTag>(tag, (prev) => {
       if (prev == undefined) return;
+      if (Object.keys(prev.data).length == 1) return undefined;
       var ret = { ...prev, data: { ...prev.data } };
-      delete ret.data[key];
+      delete ret.data[dptr.id];
       ret.size = sizeof(ret);
       return ret;
     });
     var datum = await kv.get<KVDataTag>(tag);
-    if (datum ? datum.data.length == 0 : false) {
-      kv.delete(tag);
-      KVManager.removeBlock(1); // Get number for realsies later
+    if (datum == undefined) {
+      KVManager.removeBlock(dptr.tag);
     }
+  }
+
+  protected static async getData(dptr: DataPtr) {
+    const tag = dataPrefix + dptr.tag;
+    const datum = await kv.get<KVDataTag>(tag);
+    return datum ? datum.data[dptr.id] : undefined;
+  }
+
+  protected static async itemUpdateWillFit(
+    dptr: DataPtr,
+    newValue: item_type
+  ): Promise<boolean> {
+    const datum = await kv.get<KVDataTag>(dataPrefix + dptr.tag);
+    if (datum == undefined) return false;
+    const prevSize = sizeof({ [dptr.id]: datum.data[dptr.id] });
+    const newSize = sizeof({ [dptr.id]: newValue });
+    return datum.size - prevSize + newSize < MAX_TAG_SIZE;
+  }
+
+  protected static async findTagSpace(
+    k: id_type,
+    v: item_type
+  ): Promise<number> {
+    const size = sizeof({ [k]: v });
+    const hdr = await KVManager.getHeader('header0');
+    var max: number = -1;
+    for (var b of hdr.blocks) {
+      const blockNum = b as number;
+      max = blockNum > max ? (blockNum as number) : max;
+      const datum = await kv.get<KVDataTag>(dataPrefix + blockNum);
+      if ((datum ? datum.size : 0) + size < MAX_TAG_SIZE) {
+        return blockNum;
+      }
+    }
+    var tagNum = max + 1;
+    if (!(tagNum in hdr.blocks)) KVManager.addBlock(tagNum);
+    return tagNum;
   }
 
   static async get(key: string) {
     const hdr = await KVManager.getHeader('header0');
     if (!(key in hdr.dataptr)) return undefined;
 
-    const datum = await kv.get<KVDataTag>(dataPrefix + hdr.dataptr[key]);
-    if (datum == undefined)
-      throw new Error('Something fucked up. Recommend you to clear it all');
-    return datum.data[key];
+    const dptr = hdr.dataptr[key];
+    return KVManager.getData(dptr);
   }
 
   // Cases:
@@ -135,48 +181,35 @@ class KVManager {
   //  Key already exists but needs to be moved to a new tag
   static async set(key: string, value: pylon.Json) {
     const hdr = await KVManager.getHeader('header0');
-    var tagNum = hdr.blocks.length;
 
-    const addSize = sizeof({ [key]: value });
+    var dptr: DataPtr = { id: key, tag: -1 };
+    var findNewTag = false;
 
-    // Get tag number to insert into
-    for (var b of hdr.blocks) {
-      const datum = await kv.get<KVDataTag>(dataPrefix + b);
-      if ((datum ? datum.size : 0) + addSize < MAX_TAG_SIZE) {
-        tagNum = b as number;
-        break;
-      }
-    }
     // Check for in-place update case. Its simpler.
     if (key in hdr.dataptr) {
-      const datum = await kv.get<KVDataTag>(dataPrefix + hdr.dataptr[key]);
-      if (datum == undefined)
-        throw new Error('Something fucked up. Recommend you to clear it all');
-      var item = datum.data[key];
-
-      if (datum.size - sizeof({ [key]: item }) + addSize < MAX_TAG_SIZE) {
-        tagNum = hdr.dataptr[key];
-        // We should really not do the for loop above, but im lazy
-      } else {
-        // If it exists but needs to be moved, we do delete it from its corresponding tag.
-        KVManager.deleteKeyTag(dataPrefix + hdr.dataptr[key], key);
-        KVManager.updateKeyHdr('header0', key, tagNum);
+      dptr = hdr.dataptr[key];
+      findNewTag = await KVManager.itemUpdateWillFit(dptr, value);
+      if (!findNewTag) {
+        // If it exists but needs to be moved, we delete it from its corresponding tag.
+        KVManager.deleteKeyTag(dptr);
       }
     }
 
-    if (!(key in hdr.dataptr)) {
-      KVManager.updateKeyHdr('header0', key, tagNum);
+    if (!findNewTag) {
+      dptr.tag = await KVManager.findTagSpace(dptr.id, value);
+      KVManager.updateKeyHdr('header0', key, dptr);
     }
-    if (!(tagNum in hdr.blocks)) KVManager.addBlock(tagNum);
-    KVManager.updateKeyTag(dataPrefix + tagNum, key, value);
+
+    KVManager.updateKeyTag(dptr, value); // Need to replace tagNum & key with dptr stuff.
   }
 
   static async delete(key: string) {
     const hdr = await KVManager.getHeader('header0');
     if (!(key in hdr.dataptr)) return;
+    const dptr = hdr.dataptr[key];
 
     KVManager.deleteKeyHdr('header0', key);
-    KVManager.deleteKeyTag(dataPrefix + hdr.dataptr[key], key);
+    KVManager.deleteKeyTag(dptr);
   }
 
   static async keysUsed() {
@@ -195,6 +228,10 @@ class KVManager {
   // get internal structure for debug
   static async items() {
     return kv.items();
+  }
+
+  static async getArrayBuffer(key: string) {
+    return kv.getArrayBuffer(key);
   }
 }
 
