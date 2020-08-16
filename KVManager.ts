@@ -2,7 +2,7 @@ const ns = 'kv-manager';
 const kv = new pylon.KVNamespace(ns);
 const headerPrefix = 'header';
 const dataPrefix = 'data';
-const MAX_TAG_SIZE = 100; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
+const MAX_TAG_SIZE = 8100; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
 
 type id_type = string;
 type item_type = pylon.Json;
