@@ -43,7 +43,8 @@ The keys are: dataitem1, dataitem2, dataitem3, a, b
 
 The ids are:  ¡, ¢, £, ¤, ¥
 
-
+The headers maintain a list of string-indexed pointers that determine where the associated data is located. The first character tells the manager which bin the data is in (`¢ -> 1`), and the second character is the id string.
+These arbitrary characters come from the text encoding of utf-16. I started counting from 161 because all character codes 161 to 7424 are printable. This puts a restriction of only 65536 data tags allowed, but that's fine because we're limited to 256 anyways.
 
 
 ## TODO
