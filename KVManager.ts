@@ -2,7 +2,7 @@ const ns = 'kv-manager';
 const kv = new pylon.KVNamespace(ns);
 const headerPrefix = 'header';
 const dataPrefix = 'data';
-const MAX_TAG_SIZE = 8100; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
+const MAX_TAG_SIZE = 100; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
 
 type id_type = string;
 type item_type = pylon.Json;
@@ -281,6 +281,8 @@ class KVManager {
   //  Key already exists & enough space
   //  Key doesn't exist and needs to start a new tag
   //  Key already exists but needs to be moved to a new tag
+  // Potentially 4 await calls, though I should only need 2 of them.
+  //  - findDataPtr & findEmptyTag will look through all tags, cache them?
   static async set(key: string, value: pylon.Json) {
     let [dptr, hdrTag] = await KVManager.findDataPtr(key);
     var findNewTag = true;
@@ -306,7 +308,7 @@ class KVManager {
       KVManager.updateKeyHdr(hdrTag, key, dptr);
     }
 
-    KVManager.updateKeyTag(dptr, value); // Need to replace tagNum & key with dptr stuff.
+    KVManager.updateKeyTag(dptr, value);
   }
 
   static async delete(key: string) {
@@ -317,13 +319,25 @@ class KVManager {
     KVManager.deleteKeyTag(dptr);
   }
 
-  static async keysUsed() {
+  static async tagsUsed() {
     return kv.count();
   }
 
+  static async listKeys(): Promise<string[]> {
+    const headers = (await kv.list({ from: headerPrefix })).filter((tag) =>
+      tag.startsWith(headerPrefix)
+    );
+    const keys = await Promise.all(
+      headers.map(async (hdrTag) => {
+        const hdr = await KVManager.getHeader(hdrTag);
+        return Object.keys(hdr.dataptr);
+      })
+    );
+    return keys.flat(1);
+  }
+
   static async numKeys() {
-    const hdr = await KVManager.getHeader('header0');
-    return Object.keys(hdr.dataptr).length;
+    return (await KVManager.listKeys()).length;
   }
 
   static async clear() {
