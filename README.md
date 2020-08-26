@@ -18,6 +18,16 @@ Here's the list of functions:
 
 (I hope the functions are more or less self-explanatory)
 
+## get Cache
+If you're doing a lot of `get` operations, I implemented a vv simple caching system to hopefully speed things up. In a simple test, I was able to go from ~100 `KVManager.get()` operations to ~160 `KVManager.get()` operations.
+
+```typescript
+KVManager.get('a', true);  // Use cache if available
+KVManager.get('a');        // Do not use cache
+```
+
+**WARNING**: The cache doesn't check for validity. So don't use caching if you're doing a lot of get/set simultaneously. It's meant for handling many consecutive `get` requests.
+
 ## How it works
 Terminology- I call the original kv keys `tags` and the user stored keys `keys`. Also I use an intermediary 1-character unique identifier `id`. 
 
