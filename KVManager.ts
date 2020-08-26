@@ -41,6 +41,9 @@ const emptyTag: KVDataTag = {
   data: {}
 };
 
+var headerCache: { [key: string]: KVMHeader } = {};
+var dataCache: { [key: string]: KVDataTag } = {};
+
 function sizeof(obj: pylon.Json) {
   return new TextEncoder().encode(JSON.stringify(obj)).byteLength;
 }
@@ -92,19 +95,27 @@ async function PromiseAny<T, V>(
 //    - Request check-and-set with custom equality condition for faster setting
 // Works by storing multiple `key` within each `tag` plus a few `header tag` to manage information & reduce search time.
 class KVManager {
-  protected static async getHeader(headerTag: string): Promise<KVMHeader> {
+  protected static async getHeader(
+    headerTag: string,
+    cache?: boolean
+  ): Promise<KVMHeader> {
+    if (cache) {
+      if (headerTag in headerCache) return headerCache[headerTag];
+    }
     const hdr = await kv.get<KVMHeader>(headerTag);
     if (hdr === undefined) {
       kv.put(headerTag, newhdr);
       return newhdr;
     }
+    headerCache[headerTag] = hdr;
     return hdr;
   }
 
   // Crazy ass asynchronous search. Looks through all headers for a key.
   //   Return: That header's tag plus the header object, or ['', undefined] if key is not found.
   protected static async findKeyHeader(
-    key: string
+    key: string,
+    cache?: boolean
   ): Promise<[string, KVMHeader | undefined]> {
     const headers = (await kv.list({ from: headerPrefix })).filter((tag) =>
       tag.startsWith(headerPrefix)
@@ -112,7 +123,7 @@ class KVManager {
     return PromiseAny<string, [string, KVMHeader | undefined]>(
       headers,
       async (hdrTag: string) => {
-        const hdr = await KVManager.getHeader(hdrTag);
+        const hdr = await KVManager.getHeader(hdrTag, cache);
         if (key in hdr.dataptr) return [hdrTag, hdr];
       },
       async () => ['', undefined]
@@ -120,15 +131,18 @@ class KVManager {
   }
 
   protected static async findDataPtr(
-    key: string
+    key: string,
+    cache?: boolean
   ): Promise<[DataPtr, string | undefined]> {
-    const [hdrTag, hdr] = await KVManager.findKeyHeader(key);
+    const blyat = await KVManager.findKeyHeader(key, false);
+    const [hdrTag, hdr] = blyat;
     if (hdr == undefined) return [{ tag: -1, id: '' }, undefined];
 
     return [expandDP2(hdr.dataptr[key]), hdrTag];
   }
 
   protected static async incrementID(): Promise<number> {
+    delete headerCache['header0'];
     return (
       await kv.transactWithResult<KVMHeader, number>(
         'header0',
@@ -144,8 +158,9 @@ class KVManager {
 
   // Creates/updates a header entry for a key
   protected static async updateKeyHdr(hdrTag: string, k: string, dp: DataPtr) {
+    delete headerCache[hdrTag];
     kv.transact<KVMHeader>(hdrTag, (hdr = newhdr) => {
-      var ret = {
+      let ret = {
         ...hdr,
         dataptr: { ...hdr.dataptr, [k]: compressDataPtr(dp) }
       };
@@ -155,10 +170,11 @@ class KVManager {
 
   // Deletes a key's header entry
   protected static async deleteKeyHdr(hdrTag: string, key: string) {
+    delete headerCache[hdrTag];
     kv.transact<KVMHeader>(hdrTag, (hdr) => {
       if (hdr == undefined) return;
       if (hdrTag != 'header0' && Object.keys(hdr.dataptr).length == 1) return;
-      var ret = { ...hdr, dataptr: { ...hdr.dataptr } };
+      let ret = { ...hdr, dataptr: { ...hdr.dataptr } };
       delete ret.dataptr[key];
       return ret;
     });
@@ -166,6 +182,7 @@ class KVManager {
 
   // Adds blocks to header if needed. Only first header has a blocklist
   protected static async addBlock(dataBlock: number) {
+    delete headerCache['header0'];
     kv.transact<KVMHeader>('header0', (hdr = newhdr) => {
       if (!(dataBlock in hdr.blocks)) {
         return { ...hdr, blocks: [...hdr.blocks, dataBlock] };
@@ -176,9 +193,10 @@ class KVManager {
 
   // Remove a block from the header.
   protected static async removeBlock(dataBlock: number) {
+    delete headerCache['header0'];
     kv.transact<KVMHeader>('header0', (hdr = newhdr) => {
       if (dataBlock in hdr.blocks) {
-        var ret = { ...hdr, blocks: [...hdr.blocks] };
+        let ret = { ...hdr, blocks: [...hdr.blocks] };
         ret.blocks.splice(ret.blocks.indexOf(dataBlock), 1);
         return ret;
       }
@@ -187,8 +205,9 @@ class KVManager {
 
   // Updates a key within a tag.
   protected static async updateKeyTag(dptr: DataPtr, v: item_type) {
+    delete dataCache[dataPrefix + dptr.tag];
     kv.transact<KVDataTag>(dataPrefix + dptr.tag, (prev = emptyTag) => {
-      var ret = { ...prev, data: { ...prev.data, [dptr.id]: v } };
+      let ret = { ...prev, data: { ...prev.data, [dptr.id]: v } };
       ret.size = sizeof(ret);
       return ret;
     });
@@ -197,10 +216,11 @@ class KVManager {
   // Deletes a key within a tag
   protected static async deleteKeyTag(dptr: DataPtr) {
     const tag = dataPrefix + dptr.tag;
+    delete dataCache[tag];
     await kv.transact<KVDataTag>(tag, (prev) => {
       if (prev == undefined) return;
       if (Object.keys(prev.data).length == 1) return undefined;
-      var ret = { ...prev, data: { ...prev.data } };
+      let ret = { ...prev, data: { ...prev.data } };
       delete ret.data[dptr.id];
       ret.size = sizeof(ret);
       return ret;
@@ -211,9 +231,13 @@ class KVManager {
     }
   }
 
-  protected static async getData(dptr: DataPtr) {
+  protected static async getData(dptr: DataPtr, cache?: boolean) {
     const tag = dataPrefix + dptr.tag;
+    if (cache) {
+      if (tag in dataCache) return dataCache[tag];
+    }
     const datum = await kv.get<KVDataTag>(tag);
+    if (datum) dataCache[tag] = datum;
     return datum ? datum.data[dptr.id] : undefined;
   }
 
@@ -271,9 +295,9 @@ class KVManager {
     );
   }
 
-  static async get(key: string) {
-    const [dptr, hdrFound] = await KVManager.findDataPtr(key);
-    return hdrFound ? KVManager.getData(dptr) : undefined;
+  static async get(key: string, cache?: boolean) {
+    const [dptr, hdrFound] = await KVManager.findDataPtr(key, cache);
+    return hdrFound ? KVManager.getData(dptr, cache) : undefined;
   }
 
   // Cases:
@@ -285,7 +309,7 @@ class KVManager {
   //  - findDataPtr & findEmptyTag will look through all tags, cache them?
   static async set(key: string, value: pylon.Json) {
     let [dptr, hdrTag] = await KVManager.findDataPtr(key);
-    var findNewTag = true;
+    let findNewTag = true;
 
     // Check for in-place update case. Its simpler.
     if (hdrTag) {
@@ -349,7 +373,15 @@ class KVManager {
     return kv.items();
   }
 
-  static async testfn() {}
+  static showCache() {
+    const z1 = Object.keys(headerCache);
+    const z2 = Object.keys(dataCache);
+    return z1.concat(z2);
+  }
+
+  static async testfn() {
+    return KVManager.showCache();
+  }
 }
 
 export default KVManager;
