@@ -2,7 +2,7 @@ const ns = 'kv-manager';
 const kv = new pylon.KVNamespace(ns);
 const headerPrefix = 'header';
 const dataPrefix = 'data';
-const MAX_TAG_SIZE = 8100; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
+const MAX_TAG_SIZE = 2000; // Give it a solid chunk of wiggle room b/c size estimation is inaccurate.
 
 type id_type = string;
 type item_type = pylon.Json;
@@ -71,19 +71,16 @@ const expandDP2 = (dp2: DP2): DataPtr => {
 
 const hdrNum = (hdrTag: string) => parseInt(hdrTag.substr(headerPrefix.length));
 const dataNum = (datTag: string) => parseInt(datTag.substr(dataPrefix.length));
-async function PromiseAny<T, V>(
+async function NotPromiseAny<T, V>(
   list: T[],
   mapFunction: (arg0: T) => Promise<V | undefined>,
   allFailed: () => Promise<V>
 ): Promise<V> {
-  return Promise.all(
-    list.map(async (v) => {
-      const out = await mapFunction(v);
-      if (out !== undefined) throw out;
-    })
-  )
-    .then(allFailed)
-    .catch((ret: V) => ret);
+  for (const v of list) {
+    const out = await mapFunction(v);
+    if (out !== undefined) return out;
+  }
+  return allFailed();
 }
 
 // KVManager manages the KV space for your bot, allowing you to store information more densely & bypass the 256 key limit.
@@ -111,7 +108,8 @@ class KVManager {
     return hdr;
   }
 
-  // Crazy ass asynchronous search. Looks through all headers for a key.
+  // Crazy ass ~~asynchronous~~ search. Looks through all headers for a key.
+  // Now is synchronous. Turns out async is faster but consumes my compute time like crazy
   //   Return: That header's tag plus the header object, or ['', undefined] if key is not found.
   protected static async findKeyHeader(
     key: string,
@@ -120,7 +118,7 @@ class KVManager {
     const headers = (await kv.list({ from: headerPrefix })).filter((tag) =>
       tag.startsWith(headerPrefix)
     );
-    return PromiseAny<string, [string, KVMHeader | undefined]>(
+    return NotPromiseAny<string, [string, KVMHeader | undefined]>(
       headers,
       async (hdrTag: string) => {
         const hdr = await KVManager.getHeader(hdrTag, cache);
@@ -147,6 +145,12 @@ class KVManager {
       await kv.transactWithResult<KVMHeader, number>(
         'header0',
         (hdr = newhdr) => {
+          if (hdr == undefined) {
+            return {
+              next: { ...newhdr, nextID: newhdr.nextID + 1 },
+              result: newhdr.nextID
+            };
+          }
           return {
             next: { ...hdr, nextID: hdr.nextID + 1 },
             result: hdr.nextID
@@ -256,7 +260,7 @@ class KVManager {
   protected static async findEmptyTag(size: number): Promise<number> {
     const hdr = await KVManager.getHeader('header0'); // This one always header0
 
-    return PromiseAny(
+    return NotPromiseAny(
       hdr.blocks,
       async (blockNum) => {
         const datum = await kv.get<KVDataTag>(dataPrefix + blockNum);
@@ -285,7 +289,7 @@ class KVManager {
       tag.startsWith(headerPrefix)
     );
 
-    return PromiseAny(
+    return NotPromiseAny(
       headers,
       async (hdrTag) => {
         const hdr = await KVManager.getHeader(hdrTag);
